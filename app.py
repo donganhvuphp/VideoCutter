@@ -16,10 +16,9 @@ class Worker(QtCore.QThread):
     log = QtCore.Signal(str)
     done = QtCore.Signal(bool)
 
-    def __init__(self, input_dir: Path, output_dir: Path, mode: str, interval_sec: int):
+    def __init__(self, input_dirs: List[Path], mode: str, interval_sec: int):
         super().__init__()
-        self.input_dir = input_dir
-        self.output_dir = output_dir
+        self.input_dirs = input_dirs
         self.mode = mode  # 'frames' or 'segments'
         self.interval_sec = interval_sec
         self._cancelled = False
@@ -34,25 +33,30 @@ class Worker(QtCore.QThread):
                 self.done.emit(False)
                 return
 
-            videos = self._collect_videos(self.input_dir)
-            total = len(videos)
+            # Collect all videos from all input directories
+            all_videos = []
+            for input_dir in self.input_dirs:
+                videos = self._collect_videos(input_dir)
+                all_videos.extend([(input_dir, video) for video in videos])
+
+            total = len(all_videos)
             if total == 0:
-                self.log.emit("No videos found in the selected folder.")
+                self.log.emit("No videos found in the selected folder(s).")
                 self.done.emit(False)
                 return
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            for i, video in enumerate(videos, start=1):
+            for i, (input_dir, video) in enumerate(all_videos, start=1):
                 if self._cancelled:
                     self.log.emit("\n⛔ Cancelled by user.")
                     self.done.emit(False)
                     return
 
                 base = video.stem
-                out_root = self.output_dir / f"{base}-{ts}"
+                out_root = input_dir / f"{base}-{ts}"
                 out_root.mkdir(parents=True, exist_ok=True)
 
-                self.log.emit(f"\n➡️ Processing: {video.name}")
+                self.log.emit(f"\n➡️ Processing [{i}/{total}]: {video.name}")
                 ok = False
                 if self.mode == "frames":
                     ok = self._extract_frames(video, out_root, self.interval_sec)
@@ -147,6 +151,98 @@ class Worker(QtCore.QThread):
             self.log.emit(f"   Exception: {e}")
             return False
 
+class SubfolderSelectionDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Subfolders")
+        self.setMinimumSize(600, 500)
+        self.selected_folders: List[Path] = []
+        self.parent_folder: Path | None = None
+
+        # Layout
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Parent folder selection
+        parent_row = QtWidgets.QHBoxLayout()
+        self.parent_label = QtWidgets.QLabel("No parent folder selected")
+        parent_btn = QtWidgets.QPushButton("Select Parent Folder…")
+        parent_btn.clicked.connect(self.select_parent_folder)
+        parent_row.addWidget(self.parent_label, 1)
+        parent_row.addWidget(parent_btn)
+        layout.addLayout(parent_row)
+
+        # Checkbox list
+        list_label = QtWidgets.QLabel("Select subfolders to process:")
+        layout.addWidget(list_label)
+
+        self.subfolder_list = QtWidgets.QListWidget()
+        self.subfolder_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        layout.addWidget(self.subfolder_list)
+
+        # Select all / Clear all buttons
+        select_row = QtWidgets.QHBoxLayout()
+        select_all_btn = QtWidgets.QPushButton("Select All")
+        clear_all_btn = QtWidgets.QPushButton("Clear All")
+        select_all_btn.clicked.connect(self.select_all)
+        clear_all_btn.clicked.connect(self.clear_all)
+        select_row.addWidget(select_all_btn)
+        select_row.addWidget(clear_all_btn)
+        select_row.addStretch()
+        layout.addLayout(select_row)
+
+        # OK / Cancel buttons
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def select_parent_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Parent Folder")
+        if folder:
+            self.parent_folder = Path(folder)
+            self.parent_label.setText(str(self.parent_folder))
+            self.load_subfolders()
+
+    def load_subfolders(self):
+        self.subfolder_list.clear()
+        if not self.parent_folder or not self.parent_folder.exists():
+            return
+
+        subfolders = [d for d in self.parent_folder.iterdir() if d.is_dir()]
+        subfolders.sort()
+
+        for subfolder in subfolders:
+            item = QtWidgets.QListWidgetItem(subfolder.name)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Unchecked)
+            item.setData(QtCore.Qt.UserRole, subfolder)
+            self.subfolder_list.addItem(item)
+
+    def select_all(self):
+        for i in range(self.subfolder_list.count()):
+            item = self.subfolder_list.item(i)
+            item.setCheckState(QtCore.Qt.Checked)
+
+    def clear_all(self):
+        for i in range(self.subfolder_list.count()):
+            item = self.subfolder_list.item(i)
+            item.setCheckState(QtCore.Qt.Unchecked)
+
+    def accept(self):
+        self.selected_folders = []
+        for i in range(self.subfolder_list.count()):
+            item = self.subfolder_list.item(i)
+            if item.checkState() == QtCore.Qt.Checked:
+                self.selected_folders.append(item.data(QtCore.Qt.UserRole))
+
+        if not self.selected_folders:
+            QtWidgets.QMessageBox.warning(self, "No Selection", "Please select at least one subfolder.")
+            return
+
+        super().accept()
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -159,12 +255,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
 
         # Inputs
-        self.input_dir_edit = QtWidgets.QLineEdit()
-        self.output_dir_edit = QtWidgets.QLineEdit()
-        in_btn = QtWidgets.QPushButton("Browse…")
-        out_btn = QtWidgets.QPushButton("Browse…")
-        in_btn.clicked.connect(self.pick_input_dir)
-        out_btn.clicked.connect(self.pick_output_dir)
+        self.input_dirs: List[Path] = []
+        self.input_dirs_label = QtWidgets.QLabel("No folders selected")
+        self.input_dirs_label.setWordWrap(True)
+        in_btn = QtWidgets.QPushButton("Select Folders…")
+        clear_btn = QtWidgets.QPushButton("Clear")
+        in_btn.clicked.connect(self.pick_input_dirs)
+        clear_btn.clicked.connect(self.clear_selection)
 
         # Mode
         self.mode_frames = QtWidgets.QRadioButton("Cut to **images** (frames)")
@@ -199,13 +296,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Layouts
         form = QtWidgets.QFormLayout()
         in_row = QtWidgets.QHBoxLayout()
-        in_row.addWidget(self.input_dir_edit)
+        in_row.addWidget(self.input_dirs_label, 1)
+        in_row.addWidget(clear_btn)
         in_row.addWidget(in_btn)
-        out_row = QtWidgets.QHBoxLayout()
-        out_row.addWidget(self.output_dir_edit)
-        out_row.addWidget(out_btn)
-        form.addRow("Input folder (videos)", in_row)
-        form.addRow("Output folder", out_row)
+        form.addRow("Input folders (videos)", in_row)
 
         mode_box = QtWidgets.QGroupBox("Mode")
         mode_layout = QtWidgets.QVBoxLayout()
@@ -265,38 +359,42 @@ class MainWindow(QtWidgets.QMainWindow):
             """
         )
 
-    def pick_input_dir(self):
-        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select input folder")
-        if d:
-            self.input_dir_edit.setText(d)
+    def pick_input_dirs(self):
+        dialog = SubfolderSelectionDialog(self)
+        if dialog.exec():
+            self.input_dirs = dialog.selected_folders
+            if len(self.input_dirs) == 1:
+                self.input_dirs_label.setText(str(self.input_dirs[0]))
+            else:
+                self.input_dirs_label.setText(
+                    f"{len(self.input_dirs)} folders selected:\n" +
+                    "\n".join(str(d) for d in self.input_dirs)
+                )
 
-    def pick_output_dir(self):
-        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select output folder")
-        if d:
-            self.output_dir_edit.setText(d)
+    def clear_selection(self):
+        self.input_dirs = []
+        self.input_dirs_label.setText("No folders selected")
 
     def start(self):
-        input_dir = Path(self.input_dir_edit.text().strip())
-        output_dir = Path(self.output_dir_edit.text().strip())
+        if not self.input_dirs:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "Please select at least one input folder.")
+            return
+
+        # Validate all input directories
+        for input_dir in self.input_dirs:
+            if not input_dir.exists() or not input_dir.is_dir():
+                QtWidgets.QMessageBox.warning(self, APP_NAME, f"Invalid input folder: {input_dir}")
+                return
+
         interval = int(self.interval_spin.value())
         mode = "frames" if self.mode_frames.isChecked() else "segments"
-
-        if not input_dir.exists() or not input_dir.is_dir():
-            QtWidgets.QMessageBox.warning(self, APP_NAME, "Please select a valid input folder.")
-            return
-        if not output_dir.exists():
-            try:
-                output_dir.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, APP_NAME, f"Cannot create output folder: {e}")
-                return
 
         self.log.clear()
         self.progress_bar.setValue(0)
         self.start_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
 
-        self.worker = Worker(input_dir, output_dir, mode, interval)
+        self.worker = Worker(self.input_dirs, mode, interval)
         self.worker.progress.connect(self.on_progress)
         self.worker.log.connect(self.append_log)
         self.worker.done.connect(self.on_done)
